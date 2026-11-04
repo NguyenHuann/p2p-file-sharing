@@ -2,7 +2,7 @@
  * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
  */
 
-package com.mycompany.p2p.file.sharing;
+package com.mycompany.p2pfilesharing;
 
 /**
  *
