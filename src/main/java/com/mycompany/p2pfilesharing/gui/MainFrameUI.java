@@ -1804,7 +1804,7 @@ private JScrollPane scrollOf(JTable t) {
     return sp;
 }
 
-private static String formatSize(long b) {
+public static String formatSize(long b) {
     if (b < 1024) return b + " B";
     double kb = b / 1024.0;
     if (kb < 1024) return String.format("%.1f KB", kb);
@@ -2356,7 +2356,7 @@ private void showAllLogs() {
         java.awt.EventQueue.invokeLater(() -> {
             MainFrameUI f = new MainFrameUI();
             f.setVisible(true);
-            f.startDemo();
+            // f.startDemo(); // Tắt demo ảo để dùng cho dữ liệu mạng thật
         });
     }
 
