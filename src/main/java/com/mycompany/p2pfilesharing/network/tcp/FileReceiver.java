@@ -12,8 +12,8 @@ import java.net.Socket;
 
 /**
  * TCP Server - Lắng nghe, nhận luồng byte và lưu xuống ổ cứng.
- * Hỗ trợ phân mảnh (Chunking), kiểm tra toàn vẹn (SHA-1/MD5) và tạm dừng/tiếp tục (Resume/Pause).
- * Nhiệm vụ 3 - Huân (Code đơn giản, sáng sủa theo mẫu Socket truyền thống)
+ * Hỗ trợ phân mảnh (Chunking), kiểm tra toàn vẹn (SHA-1/MD5) và tạm dừng/tiếp
+ * tục (Resume/Pause).
  */
 public class FileReceiver implements Runnable {
 
@@ -24,13 +24,26 @@ public class FileReceiver implements Runnable {
 
     // Interface lắng nghe sự kiện nhận file (dành cho GUI của Ngân kết nối)
     public interface FileReceiverListener {
-        default void onStart(String fileName, String senderIp, long totalBytes, long startOffset) {}
-        default void onProgress(String fileName, long bytesReceived, long totalBytes, int percent, double speedMBs) {}
-        default void onPaused(String fileName, long currentBytes) {}
-        default void onResumed(String fileName, long currentBytes) {}
-        default void onCompleted(String fileName, File savedFile, long totalBytes) {}
-        default void onStopped(String fileName, long bytesReceived) {}
-        default void onError(String fileName, String errorMessage, Exception ex) {}
+        default void onStart(String fileName, String senderIp, long totalBytes, long startOffset) {
+        }
+
+        default void onProgress(String fileName, long bytesReceived, long totalBytes, int percent, double speedMBs) {
+        }
+
+        default void onPaused(String fileName, long currentBytes) {
+        }
+
+        default void onResumed(String fileName, long currentBytes) {
+        }
+
+        default void onCompleted(String fileName, File savedFile, long totalBytes) {
+        }
+
+        default void onStopped(String fileName, long bytesReceived) {
+        }
+
+        default void onError(String fileName, String errorMessage, Exception ex) {
+        }
     }
 
     private int port;
@@ -41,6 +54,9 @@ public class FileReceiver implements Runnable {
     private ServerSocket serverSocket;
     private Thread serverThread;
     private FileReceiverListener listener;
+    private volatile Socket currentClientSocket;
+    private volatile String currentReceivingFileName = "";
+    private volatile long currentBytesReceived = 0;
 
     public FileReceiver() {
         this(DEFAULT_PORT, new File("./received_files"), null);
@@ -94,7 +110,8 @@ public class FileReceiver implements Runnable {
      * Bật Server nhận file trong một luồng nền.
      */
     public synchronized void start() {
-        if (running) return;
+        if (running)
+            return;
         running = true;
         paused = false;
         serverThread = new Thread(this, "FileReceiver-Thread");
@@ -106,7 +123,10 @@ public class FileReceiver implements Runnable {
      */
     public void pause() {
         this.paused = true;
-        System.out.println("[TCP RECEIVER] Đã tạm dừng nhận file.");
+        System.out.println("[TCP RECEIVER] Đã tạm dừng nhận file: " + currentReceivingFileName);
+        if (listener != null && !currentReceivingFileName.isEmpty()) {
+            listener.onPaused(currentReceivingFileName, currentBytesReceived);
+        }
     }
 
     /**
@@ -114,7 +134,10 @@ public class FileReceiver implements Runnable {
      */
     public void resume() {
         this.paused = false;
-        System.out.println("[TCP RECEIVER] Tiếp tục nhận file.");
+        System.out.println("[TCP RECEIVER] Tiếp tục nhận file: " + currentReceivingFileName);
+        if (listener != null && !currentReceivingFileName.isEmpty()) {
+            listener.onResumed(currentReceivingFileName, currentBytesReceived);
+        }
     }
 
     /**
@@ -123,6 +146,11 @@ public class FileReceiver implements Runnable {
     public synchronized void stop() {
         running = false;
         paused = false;
+        if (currentClientSocket != null && !currentClientSocket.isClosed()) {
+            try {
+                currentClientSocket.close();
+            } catch (IOException ignored) {}
+        }
         try {
             if (serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
@@ -183,11 +211,16 @@ public class FileReceiver implements Runnable {
         String fileName = "";
 
         try {
+            currentClientSocket = socket;
             dis = new DataInputStream(socket.getInputStream());
             dos = new DataOutputStream(socket.getOutputStream());
 
             // 1. Nhận thông tin bắt tay (Handshake) từ Client
             fileName = dis.readUTF();
+            // Lọc tên file để tránh các ký tự đường dẫn bất thường
+            fileName = new File(fileName).getName();
+            currentReceivingFileName = fileName;
+
             long totalBytes = dis.readLong();
             String expectedHash = dis.readUTF();
 
@@ -222,11 +255,16 @@ public class FileReceiver implements Runnable {
 
             // 3. Mở file bằng RandomAccessFile và nhảy đến vị trí offset để ghi nối tiếp
             raf = new RandomAccessFile(targetFile, "rw");
-            raf.seek(startOffset);
+            if (startOffset == 0) {
+                raf.setLength(0); // Đảm bảo làm sạch file cũ nếu ghi mới từ đầu
+            } else {
+                raf.seek(startOffset);
+            }
 
             // 4. Phân mảnh (Chunking): Nhận từng mảnh byte nhỏ và ghi xuống đĩa
             byte[] buffer = new byte[CHUNK_SIZE];
             long bytesReceived = startOffset;
+            currentBytesReceived = bytesReceived;
             long lastTime = System.currentTimeMillis();
             long lastBytes = bytesReceived;
 
@@ -244,6 +282,7 @@ public class FileReceiver implements Runnable {
 
                 raf.write(buffer, 0, read);
                 bytesReceived += read;
+                currentBytesReceived = bytesReceived;
 
                 // Tính toán tiến độ (%) và tốc độ (MB/s)
                 long now = System.currentTimeMillis();
@@ -272,7 +311,7 @@ public class FileReceiver implements Runnable {
                 String actualHash = HashUtils.calculateFileSHA1(targetFile);
                 System.out.println("   - Mã SHA-1 thực tế: " + actualHash);
 
-                boolean isIntegrityValid = HashUtils.checkIntegrity(expectedHash, actualHash);
+                boolean isIntegrityValid = expectedHash.isEmpty() || HashUtils.checkIntegrity(expectedHash, actualHash);
                 if (isIntegrityValid) {
                     System.out.println("[TCP RECEIVER] => KIỂM TRA TOÀN VẸN THÀNH CÔNG! (Hash trùng khớp)");
                     dos.writeUTF("SUCCESS");
@@ -298,17 +337,27 @@ public class FileReceiver implements Runnable {
                 listener.onError(fileName, e.getMessage(), e);
             }
         } finally {
+            currentClientSocket = null;
+            currentReceivingFileName = "";
+            currentBytesReceived = 0;
             if (raf != null) {
-                try { raf.close(); } catch (IOException ignored) {}
+                try {
+                    raf.close();
+                } catch (IOException ignored) {
+                }
             }
             if (socket != null && !socket.isClosed()) {
-                try { socket.close(); } catch (IOException ignored) {}
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                }
             }
         }
     }
 
     /**
-     * Hàm main chạy trực tiếp Server nhận file (tương tự như EchoChatSingleServer mẫu).
+     * Hàm main chạy trực tiếp Server nhận file (tương tự như EchoChatSingleServer
+     * mẫu).
      */
     public static void main(String[] args) throws IOException {
         System.out.println("=== KHỞI ĐỘNG TCP FILE RECEIVER (NHIỆM VỤ 3 - HUÂN) ===");

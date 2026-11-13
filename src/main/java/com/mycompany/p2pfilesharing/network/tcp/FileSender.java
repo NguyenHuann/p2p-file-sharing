@@ -12,8 +12,8 @@ import java.net.Socket;
 
 /**
  * TCP Client - Đọc file từ ổ cứng và đẩy lên mạng qua Socket.
- * Hỗ trợ phân mảnh (Chunking), băm kiểm tra toàn vẹn (SHA-1/MD5) và tạm dừng/tiếp tục (Resume/Pause).
- * Nhiệm vụ 3 - Huân (Code đơn giản, sáng sủa theo mẫu Socket truyền thống)
+ * Hỗ trợ phân mảnh (Chunking), băm kiểm tra toàn vẹn (SHA-1/MD5) và tạm
+ * dừng/tiếp tục (Resume/Pause).
  */
 public class FileSender implements Runnable {
 
@@ -22,13 +22,26 @@ public class FileSender implements Runnable {
 
     // Interface lắng nghe sự kiện gửi file (dành cho GUI của Ngân kết nối)
     public interface FileSenderListener {
-        default void onStart(String fileName, long totalBytes, long startOffset) {}
-        default void onProgress(String fileName, long bytesSent, long totalBytes, int percent, double speedMBs) {}
-        default void onPaused(String fileName, long currentBytes) {}
-        default void onResumed(String fileName, long currentBytes) {}
-        default void onCompleted(String fileName, long totalBytes) {}
-        default void onStopped(String fileName, long bytesSent) {}
-        default void onError(String fileName, String errorMessage, Exception ex) {}
+        default void onStart(String fileName, long totalBytes, long startOffset) {
+        }
+
+        default void onProgress(String fileName, long bytesSent, long totalBytes, int percent, double speedMBs) {
+        }
+
+        default void onPaused(String fileName, long currentBytes) {
+        }
+
+        default void onResumed(String fileName, long currentBytes) {
+        }
+
+        default void onCompleted(String fileName, long totalBytes) {
+        }
+
+        default void onStopped(String fileName, long bytesSent) {
+        }
+
+        default void onError(String fileName, String errorMessage, Exception ex) {
+        }
     }
 
     private final String targetIp;
@@ -53,7 +66,8 @@ public class FileSender implements Runnable {
         this(targetIp, targetPort, fileToSend, senderPeerName, null);
     }
 
-    public FileSender(String targetIp, int targetPort, File fileToSend, String senderPeerName, FileSenderListener listener) {
+    public FileSender(String targetIp, int targetPort, File fileToSend, String senderPeerName,
+            FileSenderListener listener) {
         this.targetIp = targetIp;
         this.targetPort = targetPort;
         this.fileToSend = fileToSend;
@@ -72,7 +86,8 @@ public class FileSender implements Runnable {
      * Bắt đầu gửi file trong một luồng mới.
      */
     public synchronized void start() {
-        if (running) return;
+        if (running)
+            return;
         running = true;
         paused = false;
         workerThread = new Thread(this, "FileSender-Thread-" + (fileToSend != null ? fileToSend.getName() : "test"));
@@ -111,7 +126,8 @@ public class FileSender implements Runnable {
             if (socket != null && !socket.isClosed()) {
                 socket.close();
             }
-        } catch (IOException ignored) {}
+        } catch (IOException ignored) {
+        }
         System.out.println("[TCP SENDER] Đã hủy gửi: " + (fileToSend != null ? fileToSend.getName() : ""));
         if (listener != null && fileToSend != null) {
             listener.onStopped(fileToSend.getName(), bytesSent);
@@ -189,11 +205,13 @@ public class FileSender implements Runnable {
                     Thread.sleep(150);
                 }
 
-                if (!running) break;
+                if (!running)
+                    break;
 
                 int toRead = (int) Math.min(buffer.length, totalBytes - bytesSent);
                 int read = raf.read(buffer, 0, toRead);
-                if (read == -1) break;
+                if (read == -1)
+                    break;
 
                 dos.write(buffer, 0, read);
                 bytesSent += read;
@@ -244,10 +262,16 @@ public class FileSender implements Runnable {
         } finally {
             running = false;
             if (raf != null) {
-                try { raf.close(); } catch (IOException ignored) {}
+                try {
+                    raf.close();
+                } catch (IOException ignored) {
+                }
             }
             if (socket != null && !socket.isClosed()) {
-                try { socket.close(); } catch (IOException ignored) {}
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                }
             }
         }
     }
@@ -278,19 +302,27 @@ public class FileSender implements Runnable {
     public static void main(String[] args) throws IOException, InterruptedException {
         System.out.println("=== KHỞI ĐỘNG TCP FILE SENDER (NHIỆM VỤ 3 - HUÂN) ===");
 
-        // Tạo 1 file test nhỏ nếu chưa có
-        File testFile = new File("test_send.txt");
-        if (!testFile.exists()) {
-            try (FileWriter writer = new FileWriter(testFile)) {
-                for (int i = 1; i <= 500; i++) {
-                    writer.write("Dong du lieu test thu " + i + " cho du an P2P File Sharing - Nhiem vu 3 cua Huan\n");
+        String ip = (args.length > 0) ? args[0] : "127.0.0.1";
+        int port = (args.length > 1) ? Integer.parseInt(args[1]) : 9000;
+
+        File testFile;
+        if (args.length > 2) {
+            testFile = new File(args[2]);
+        } else {
+            // Tạo 1 file test nhỏ nếu chưa có
+            testFile = new File("test_send.txt");
+            if (!testFile.exists()) {
+                try (FileWriter writer = new FileWriter(testFile)) {
+                    for (int i = 1; i <= 500; i++) {
+                        writer.write("Dong du lieu test thu " + i + " cho du an P2P File Sharing - Nhiem vu 3 cua Huan\n");
+                    }
                 }
+                System.out.println("Đã tự động tạo file mẫu: " + testFile.getAbsolutePath());
             }
-            System.out.println("Đã tự động tạo file mẫu: " + testFile.getAbsolutePath());
         }
 
-        // Kết nối tới Server tại 127.0.0.1 cổng 9000
-        FileSender sender = new FileSender("127.0.0.1", 9000, testFile);
+        // Kết nối tới Server
+        FileSender sender = new FileSender(ip, port, testFile);
         // Chạy trực tiếp để quan sát console
         sender.run();
     }

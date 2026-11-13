@@ -1,13 +1,12 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package com.mycompany.p2pfilesharing.gui;
 
 /**
- *
- * @author huann
+ * Lớp giao diện chính kế thừa từ MainFrameUI.
+ * Giúp người dùng hoặc các module khác có thể khởi tạo trực tiếp qua MainFrame hoặc MainFrameUI.
  */
-public class MainFrame {
-    
+public class MainFrame extends MainFrameUI {
+
+    public MainFrame() {
+        super();
+    }
 }
