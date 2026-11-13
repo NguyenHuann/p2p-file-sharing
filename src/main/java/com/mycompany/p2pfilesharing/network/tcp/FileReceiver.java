@@ -1,66 +1,53 @@
 package com.mycompany.p2pfilesharing.network.tcp;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
+import com.mycompany.p2pfilesharing.utils.HashUtils;
+
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketException;
-import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
+/**
+ * TCP Server - Lắng nghe, nhận luồng byte và lưu xuống ổ cứng.
+ * Hỗ trợ phân mảnh (Chunking), kiểm tra toàn vẹn (SHA-1/MD5) và tạm dừng/tiếp tục (Resume/Pause).
+ * Nhiệm vụ 3 - Huân (Code đơn giản, sáng sủa theo mẫu Socket truyền thống)
+ */
 public class FileReceiver implements Runnable {
 
+    // Cổng mặc định
+    public static final int DEFAULT_PORT = 9000;
+    // Kích thước mỗi mảnh dữ liệu (Chunk size: 64 KB)
+    public static final int CHUNK_SIZE = 64 * 1024;
+
+    // Interface lắng nghe sự kiện nhận file (dành cho GUI của Ngân kết nối)
     public interface FileReceiverListener {
-        // Khi phát hiện kết nối gửi file mới */
-        default void onTransferStarted(String fileName, String senderPeerName, String senderIp, long totalBytes, long startOffset) {}
-
-        // Cập nhật tiến trình nhận dữ liệu */
+        default void onStart(String fileName, String senderIp, long totalBytes, long startOffset) {}
         default void onProgress(String fileName, long bytesReceived, long totalBytes, int percent, double speedMBs) {}
-
-        // Khi phiên nhận file bị tạm dừng */
         default void onPaused(String fileName, long currentBytes) {}
-
-        // Khi phiên nhận file được tiếp tục */
         default void onResumed(String fileName, long currentBytes) {}
-
-        // Khi nhận file hoàn tất thành công và lưu vào ổ đĩa */
         default void onCompleted(String fileName, File savedFile, long totalBytes) {}
-
-        // Khi phiên nhận file bị dừng / hủy */
         default void onStopped(String fileName, long bytesReceived) {}
-
-        // Khi xảy ra lỗi */
         default void onError(String fileName, String errorMessage, Exception ex) {}
     }
 
-    private static final int BUFFER_SIZE = 64 * 1024; // Phân mảnh đọc 64 KB
-
-    private final int port;
-    private volatile File saveDirectory;
+    private int port;
+    private File saveDirectory;
     private volatile boolean running = false;
+    private volatile boolean paused = false;
+
     private ServerSocket serverSocket;
     private Thread serverThread;
-    private final ExecutorService threadPool = Executors.newCachedThreadPool();
-
-    // Quản lý các phiên nhận file đang hoạt động */
-    private final Map<String, ReceiveSession> activeSessions = new ConcurrentHashMap<>();
     private FileReceiverListener listener;
 
+    public FileReceiver() {
+        this(DEFAULT_PORT, new File("./received_files"), null);
+    }
+
     public FileReceiver(int port) {
-        this(port, new File(System.getProperty("user.home") + File.separator + "P2PShare"), null);
+        this(port, new File("./received_files"), null);
     }
 
     public FileReceiver(int port, File saveDirectory) {
@@ -69,9 +56,11 @@ public class FileReceiver implements Runnable {
 
     public FileReceiver(int port, File saveDirectory, FileReceiverListener listener) {
         this.port = port;
-        this.saveDirectory = (saveDirectory != null) ? saveDirectory : new File(System.getProperty("user.home") + File.separator + "P2PShare");
+        this.saveDirectory = (saveDirectory != null) ? saveDirectory : new File("./received_files");
         this.listener = listener;
-        ensureSaveDirectoryExists();
+        if (!this.saveDirectory.exists()) {
+            this.saveDirectory.mkdirs();
+        }
     }
 
     public void setListener(FileReceiverListener listener) {
@@ -79,9 +68,9 @@ public class FileReceiver implements Runnable {
     }
 
     public void setSaveDirectory(File saveDirectory) {
-        if (saveDirectory != null) {
-            this.saveDirectory = saveDirectory;
-            ensureSaveDirectoryExists();
+        this.saveDirectory = saveDirectory;
+        if (this.saveDirectory != null && !this.saveDirectory.exists()) {
+            this.saveDirectory.mkdirs();
         }
     }
 
@@ -93,471 +82,238 @@ public class FileReceiver implements Runnable {
         return port;
     }
 
-    private void ensureSaveDirectoryExists() {
-        if (saveDirectory != null && !saveDirectory.exists()) {
-            saveDirectory.mkdirs();
-        }
+    public boolean isRunning() {
+        return running;
     }
 
-    // Khởi động Server TCP lắng nghe file đến.
+    public boolean isPaused() {
+        return paused;
+    }
+
+    /**
+     * Bật Server nhận file trong một luồng nền.
+     */
     public synchronized void start() {
-        if (running) {
-            return;
-        }
-        ensureSaveDirectoryExists();
+        if (running) return;
         running = true;
-        serverThread = new Thread(this, "TCP-FileReceiver-Server-" + port);
+        paused = false;
+        serverThread = new Thread(this, "FileReceiver-Thread");
         serverThread.start();
     }
 
-    // Dừng Server TCP và tất cả các phiên nhận đang hoạt động.
-     
+    /**
+     * Tạm dừng tiến trình nhận file.
+     */
+    public void pause() {
+        this.paused = true;
+        System.out.println("[TCP RECEIVER] Đã tạm dừng nhận file.");
+    }
+
+    /**
+     * Tiếp tục tiến trình nhận file.
+     */
+    public void resume() {
+        this.paused = false;
+        System.out.println("[TCP RECEIVER] Tiếp tục nhận file.");
+    }
+
+    /**
+     * Dừng Server và đóng Socket.
+     */
     public synchronized void stop() {
         running = false;
-        if (serverSocket != null && !serverSocket.isClosed()) {
-            try {
+        paused = false;
+        try {
+            if (serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
-            } catch (IOException ignored) {}
+            }
+        } catch (IOException e) {
+            System.err.println("Lỗi đóng ServerSocket: " + e.getMessage());
         }
-
-        // Dừng tất cả các phiên nhận file
-        for (ReceiveSession session : activeSessions.values()) {
-            session.stop();
-        }
-        activeSessions.clear();
-
-        threadPool.shutdownNow();
-
-        if (serverThread != null) {
-            serverThread.interrupt();
-        }
-        System.out.println("[TCP RECEIVER] Đã dừng máy chủ nhận file tại cổng " + port);
+        System.out.println("[TCP RECEIVER] Đã dừng server nhận file.");
     }
 
     @Override
     public void run() {
+        running = true;
         try {
+            if (!saveDirectory.exists()) {
+                saveDirectory.mkdirs();
+            }
+
             serverSocket = new ServerSocket(port);
-            System.out.println("[TCP RECEIVER] Đang lắng nghe nhận file tại cổng TCP " + port + ", thư mục lưu: " + saveDirectory.getAbsolutePath());
+            System.out.println("==================================================");
+            System.out.println("[TCP RECEIVER] Server đã mở tại cổng " + port);
+            System.out.println("[TCP RECEIVER] Thư mục lưu file: " + saveDirectory.getAbsolutePath());
+            System.out.println("[TCP RECEIVER] Đang chờ client kết nối để gửi file...");
+            System.out.println("==================================================");
 
             while (running) {
                 try {
-                    Socket clientSocket = serverSocket.accept();
-                    String remoteIp = clientSocket.getInetAddress().getHostAddress();
-                    System.out.println("[TCP RECEIVER] Chấp nhận kết nối từ: " + remoteIp);
+                    // Chấp nhận kết nối từ Client gửi file
+                    Socket socket = serverSocket.accept();
+                    String clientIp = socket.getInetAddress().getHostAddress();
+                    System.out.println("\n[TCP RECEIVER] Client đã kết nối: " + socket);
 
-                    // Xử lý từng kết nối gửi file trong một luồng riêng
-                    threadPool.submit(new ClientHandler(clientSocket));
-                } catch (SocketException se) {
-                    if (!running) {
-                        break; // Server socket bị đóng có chủ đích
-                    }
-                    System.err.println("[TCP RECEIVER] Lỗi Socket: " + se.getMessage());
-                } catch (IOException ioe) {
+                    // Xử lý việc nhận file từ socket vừa kết nối
+                    handleReceiveFile(socket, clientIp);
+
+                } catch (IOException e) {
                     if (running) {
-                        System.err.println("[TCP RECEIVER] Lỗi khi chấp nhận kết nối: " + ioe.getMessage());
+                        System.err.println("[TCP RECEIVER] Lỗi khi nhận kết nối: " + e.getMessage());
                     }
                 }
             }
-
         } catch (IOException e) {
             if (running) {
-                System.err.println("[TCP RECEIVER] Không thể khởi động Server Socket tại cổng " + port + ": " + e.getMessage());
+                System.err.println("[TCP RECEIVER] Không thể khởi tạo ServerSocket: " + e.getMessage());
             }
         } finally {
-            running = false;
+            stop();
         }
     }
 
-    // Tạm dừng một phiên nhận file theo tên file.
-     
-    public void pauseTransfer(String fileName) {
-        ReceiveSession session = activeSessions.get(fileName);
-        if (session != null) {
-            session.pause();
-        }
-    }
+    /**
+     * Xử lý luồng nhận dữ liệu file qua TCP Socket.
+     */
+    private void handleReceiveFile(Socket socket, String clientIp) {
+        DataInputStream dis = null;
+        DataOutputStream dos = null;
+        RandomAccessFile raf = null;
+        String fileName = "";
 
-    // Tiếp tục một phiên nhận file theo tên file.
-     
-    public void resumeTransfer(String fileName) {
-        ReceiveSession session = activeSessions.get(fileName);
-        if (session != null) {
-            session.resume();
-        }
-    }
+        try {
+            dis = new DataInputStream(socket.getInputStream());
+            dos = new DataOutputStream(socket.getOutputStream());
 
-    // Dừng hẳn một phiên nhận file theo tên file.
-     
-    public void stopTransfer(String fileName) {
-        ReceiveSession session = activeSessions.remove(fileName);
-        if (session != null) {
-            session.stop();
-        }
-    }
+            // 1. Nhận thông tin bắt tay (Handshake) từ Client
+            fileName = dis.readUTF();
+            long totalBytes = dis.readLong();
+            String expectedHash = dis.readUTF();
 
-      // Lấy danh sách tên file đang trong quá trình nhận.
-     
-    public List<String> getActiveTransfers() {
-        return new ArrayList<>(activeSessions.keySet());
-    }
+            System.out.println("[TCP RECEIVER] Nhận yêu cầu gửi file:");
+            System.out.println("   - Tên file   : " + fileName);
+            System.out.println("   - Kích thước : " + totalBytes + " bytes");
+            System.out.println("   - Hash gửi kèm: " + expectedHash);
 
-    // Lớp đại diện cho một phiên nhận file cụ thể.
-     
-    public class ReceiveSession {
-        private final String fileName;
-        private final String senderPeerName;
-        private final String senderIp;
-        private final long totalBytes;
-        private volatile long bytesReceived;
-        private volatile boolean paused = false;
-        private volatile boolean stopped = false;
-        private final Object pauseLock = new Object();
-        private final Socket socket;
-        private RandomAccessFile raf;
+            File targetFile = new File(saveDirectory, fileName);
+            long startOffset = 0;
 
-        public ReceiveSession(String fileName, String senderPeerName, String senderIp, long totalBytes, Socket socket) {
-            this.fileName = fileName;
-            this.senderPeerName = senderPeerName;
-            this.senderIp = senderIp;
-            this.totalBytes = totalBytes;
-            this.socket = socket;
-        }
-
-        public void setRaf(RandomAccessFile raf) {
-            this.raf = raf;
-        }
-
-        public void setBytesReceived(long bytesReceived) {
-            this.bytesReceived = bytesReceived;
-        }
-
-        public void pause() {
-            if (stopped || paused) return;
-            paused = true;
-            System.out.println("[TCP RECEIVER] Tạm dừng nhận file: " + fileName);
-            if (listener != null) {
-                listener.onPaused(fileName, bytesReceived);
-            }
-        }
-
-        public void resume() {
-            if (stopped || !paused) return;
-            synchronized (pauseLock) {
-                paused = false;
-                pauseLock.notifyAll();
-            }
-            System.out.println("[TCP RECEIVER] Tiếp tục nhận file: " + fileName);
-            if (listener != null) {
-                listener.onResumed(fileName, bytesReceived);
-            }
-        }
-
-        public void stop() {
-            stopped = true;
-            synchronized (pauseLock) {
-                paused = false;
-                pauseLock.notifyAll();
-            }
-            try {
-                if (socket != null && !socket.isClosed()) {
-                    socket.close();
+            // 2. Tạm dừng / Tiếp tục (Pause/Resume): Kiểm tra byte đã có trên đĩa
+            if (targetFile.exists()) {
+                long currentLen = targetFile.length();
+                if (currentLen > 0 && currentLen < totalBytes) {
+                    startOffset = currentLen;
+                    System.out.println("[TCP RECEIVER] Phát hiện file dở dang. Tiếp tục tải từ byte: " + startOffset);
+                } else if (currentLen >= totalBytes) {
+                    // Nếu file đã đầy đủ trước đó thì ghi mới
+                    targetFile.delete();
+                    startOffset = 0;
                 }
-            } catch (IOException ignored) {}
-            System.out.println("[TCP RECEIVER] Hủy nhận file: " + fileName);
-            if (listener != null) {
-                listener.onStopped(fileName, bytesReceived);
             }
-        }
 
-        public boolean isPaused() {
-            return paused;
-        }
+            // Gửi vị trí byte offset phản hồi lại cho Client biết
+            dos.writeLong(startOffset);
+            dos.flush();
 
-        public boolean isStopped() {
-            return stopped;
-        }
+            if (listener != null) {
+                listener.onStart(fileName, clientIp, totalBytes, startOffset);
+            }
 
-        public Object getPauseLock() {
-            return pauseLock;
-        }
+            // 3. Mở file bằng RandomAccessFile và nhảy đến vị trí offset để ghi nối tiếp
+            raf = new RandomAccessFile(targetFile, "rw");
+            raf.seek(startOffset);
 
-        public String getFileName() {
-            return fileName;
-        }
+            // 4. Phân mảnh (Chunking): Nhận từng mảnh byte nhỏ và ghi xuống đĩa
+            byte[] buffer = new byte[CHUNK_SIZE];
+            long bytesReceived = startOffset;
+            long lastTime = System.currentTimeMillis();
+            long lastBytes = bytesReceived;
 
-        public long getBytesReceived() {
-            return bytesReceived;
-        }
-
-        public long getTotalBytes() {
-            return totalBytes;
-        }
-
-        public String getSenderPeerName() {
-            return senderPeerName;
-        }
-
-        public String getSenderIp() {
-            return senderIp;
-        }
-    }
-
-    // Xử lý một luồng gửi dữ liệu từ một client kết nối tới.
- 
-    private class ClientHandler implements Runnable {
-        private final Socket socket;
-
-        public ClientHandler(Socket socket) {
-            this.socket = socket;
-        }
-
-        @Override
-        public void run() {
-            String remoteIp = socket.getInetAddress().getHostAddress();
-            RandomAccessFile raf = null;
-            File partFile = null;
-            String fileName = "unknown";
-            ReceiveSession session = null;
-
-            try {
-                DataInputStream dis = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-                DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-
-                // 1. Đọc Header bắt tay
-                String magic = dis.readUTF();
-                if (!"FILE_HEADER".equals(magic)) {
-                    System.err.println("[TCP RECEIVER] Gói tin không hợp lệ từ " + remoteIp + ": " + magic);
-                    dos.writeUTF("REJECT");
-                    dos.flush();
-                    return;
+            while (running && bytesReceived < totalBytes) {
+                // Xử lý tạm dừng nếu có cờ pause
+                while (paused && running) {
+                    Thread.sleep(150);
                 }
 
-                String senderPeerName = dis.readUTF();
-                fileName = dis.readUTF();
-                long totalBytes = dis.readLong();
-                String expectedHash = dis.readUTF();
+                int toRead = (int) Math.min(buffer.length, totalBytes - bytesReceived);
+                int read = dis.read(buffer, 0, toRead);
+                if (read == -1) {
+                    break; // Kết nối bị ngắt
+                }
 
-                ensureSaveDirectoryExists();
+                raf.write(buffer, 0, read);
+                bytesReceived += read;
 
-                // Sử dụng file tạm .part để hỗ trợ ghi nối tiếp (Resume)
-                partFile = new File(saveDirectory, fileName + ".part");
-                long startOffset = 0;
-
-                // 2. Kiểm tra nếu file .part đã tồn tại trước đó để tiếp tục tải (Breakpoint Resume)
-                if (partFile.exists() && partFile.isFile()) {
-                    long existingLength = partFile.length();
-                    if (existingLength > 0 && existingLength < totalBytes) {
-                        startOffset = existingLength;
-                        System.out.println("[TCP RECEIVER] Tìm thấy file dở dang (" + startOffset + "/" + totalBytes + " bytes). Tiếp tục nhận từ offset: " + startOffset);
-                    } else if (existingLength >= totalBytes) {
-                        // File tạm đã đủ hoặc lớn hơn kích cỡ file yêu cầu -> xóa làm lại
-                        partFile.delete();
-                        startOffset = 0;
+                // Tính toán tiến độ (%) và tốc độ (MB/s)
+                long now = System.currentTimeMillis();
+                if (now - lastTime >= 150 || bytesReceived >= totalBytes) {
+                    int percent = (int) (bytesReceived * 100 / totalBytes);
+                    double speedMBs = 0.0;
+                    if (now > lastTime) {
+                        speedMBs = ((bytesReceived - lastBytes) / 1024.0 / 1024.0) / ((now - lastTime) / 1000.0);
                     }
+                    if (listener != null) {
+                        listener.onProgress(fileName, bytesReceived, totalBytes, percent, speedMBs);
+                    }
+                    lastTime = now;
+                    lastBytes = bytesReceived;
                 }
+            }
 
-                // 3. Phản hồi cho máy gửi biết sẵn sàng và bắt đầu từ offset nào
-                dos.writeUTF("READY");
-                dos.writeLong(startOffset);
+            raf.close();
+            raf = null;
+
+            // 5. Kiểm tra tính toàn vẹn (Checksum Hash)
+            if (bytesReceived >= totalBytes) {
+                System.out.println("[TCP RECEIVER] Đã nhận đủ " + bytesReceived + "/" + totalBytes + " bytes.");
+                System.out.println("[TCP RECEIVER] Đang kiểm tra tính toàn vẹn file...");
+
+                String actualHash = HashUtils.calculateFileSHA1(targetFile);
+                System.out.println("   - Mã SHA-1 thực tế: " + actualHash);
+
+                boolean isIntegrityValid = HashUtils.checkIntegrity(expectedHash, actualHash);
+                if (isIntegrityValid) {
+                    System.out.println("[TCP RECEIVER] => KIỂM TRA TOÀN VẸN THÀNH CÔNG! (Hash trùng khớp)");
+                    dos.writeUTF("SUCCESS");
+                } else {
+                    System.err.println("[TCP RECEIVER] => CẢNH BÁO: Mã hash không khớp, file có thể bị lỗi!");
+                    dos.writeUTF("CORRUPTED");
+                }
                 dos.flush();
 
-                // 4. Tạo và lưu phiên nhận
-                session = new ReceiveSession(fileName, senderPeerName, remoteIp, totalBytes, socket);
-                session.setBytesReceived(startOffset);
-                activeSessions.put(fileName, session);
-
                 if (listener != null) {
-                    listener.onTransferStarted(fileName, senderPeerName, remoteIp, totalBytes, startOffset);
+                    listener.onCompleted(fileName, targetFile, totalBytes);
                 }
-
-                // 5. Mở file bằng RandomAccessFile ở chế độ "rw" và nhảy đến offset
-                raf = new RandomAccessFile(partFile, "rw");
-                session.setRaf(raf);
-                if (startOffset > 0) {
-                    raf.seek(startOffset);
-                }
-
-                byte[] buffer = new byte[BUFFER_SIZE];
-                long bytesReceived = startOffset;
-                long lastProgressTime = System.currentTimeMillis();
-                long lastBytesForSpeed = bytesReceived;
-
-                // 6. Nhận các mảnh dữ liệu và ghi vào file
-                while (!session.isStopped() && bytesReceived < totalBytes) {
-                    // Kiểm tra trạng thái Pause
-                    synchronized (session.getPauseLock()) {
-                        while (session.isPaused() && !session.isStopped()) {
-                            session.getPauseLock().wait();
-                        }
-                    }
-
-                    if (session.isStopped()) {
-                        break;
-                    }
-
-                    int toRead = (int) Math.min(buffer.length, totalBytes - bytesReceived);
-                    int read = dis.read(buffer, 0, toRead);
-                    if (read == -1) {
-                        throw new EOFException("Kết nối bị ngắt đột ngột từ máy gửi!");
-                    }
-
-                    raf.write(buffer, 0, read);
-                    bytesReceived += read;
-                    session.setBytesReceived(bytesReceived);
-
-                    // Báo cáo tiến trình định kỳ
-                    long now = System.currentTimeMillis();
-                    if (now - lastProgressTime >= 120 || bytesReceived >= totalBytes) {
-                        long timeDelta = now - lastProgressTime;
-                        double speedMBs = 0.0;
-                        if (timeDelta > 0) {
-                            speedMBs = ((bytesReceived - lastBytesForSpeed) / 1024.0 / 1024.0) / (timeDelta / 1000.0);
-                        }
-                        int percent = (totalBytes > 0) ? (int) (bytesReceived * 100 / totalBytes) : 100;
-
-                        if (listener != null) {
-                            listener.onProgress(fileName, bytesReceived, totalBytes, percent, speedMBs);
-                        }
-
-                        lastProgressTime = now;
-                        lastBytesForSpeed = bytesReceived;
-                    }
-                }
-
-                // 7. Hoàn tất nhận file
-                if (!session.isStopped() && bytesReceived >= totalBytes) {
-                    raf.close();
-                    raf = null;
-
-                    // Đổi tên file từ .part thành tên file chính thức
-                    File finalFile = resolveDestinationFile(saveDirectory, fileName);
-                    boolean renamed = partFile.renameTo(finalFile);
-                    if (!renamed) {
-                        // Thử sao chép nếu đổi tên thất bại
-                        copyFile(partFile, finalFile);
-                        partFile.delete();
-                    }
-
-                    // Kiểm tra tính toàn vẹn (Checksum SHA-256) nếu bên gửi có gửi hash
-                    boolean hashMatched = true;
-                    if (expectedHash != null && !expectedHash.trim().isEmpty()) {
-                        String actualHash = calculateSHA256(finalFile);
-                        if (!expectedHash.equalsIgnoreCase(actualHash)) {
-                            hashMatched = false;
-                            System.err.println("[TCP RECEIVER] CẢNH BÁO: Mã băm không khớp! Mong muốn: " + expectedHash + ", Thực tế: " + actualHash);
-                        }
-                    }
-
-                    // Gửi xác nhận COMPLETE về máy gửi
-                    dos.writeUTF("COMPLETE");
-                    dos.flush();
-
-                    System.out.println("[TCP RECEIVER] Nhận file thành công: " + finalFile.getName() + " (" + totalBytes + " bytes)" + (hashMatched ? " [Toàn vẹn]" : " [Cảnh báo hash]"));
-
-                    if (listener != null) {
-                        listener.onProgress(fileName, totalBytes, totalBytes, 100, 0.0);
-                        listener.onCompleted(fileName, finalFile, totalBytes);
-                    }
-                }
-
-            } catch (InterruptedException ie) {
-                System.err.println("[TCP RECEIVER] Phiên nhận file " + fileName + " bị ngắt.");
-                if (listener != null && session != null && !session.isStopped()) {
-                    listener.onStopped(fileName, session.getBytesReceived());
-                }
-            } catch (EOFException eofe) {
-                System.err.println("[TCP RECEIVER] Kết nối bị đóng sớm từ máy gửi cho file " + fileName + ": " + eofe.getMessage());
-                if (listener != null && session != null && !session.isStopped()) {
-                    listener.onStopped(fileName, session.getBytesReceived());
-                }
-            } catch (Exception e) {
-                if (session == null || !session.isStopped()) {
-                    System.err.println("[TCP RECEIVER] Lỗi khi nhận file " + fileName + ": " + e.getMessage());
-                    if (listener != null) {
-                        listener.onError(fileName, e.getMessage(), e);
-                    }
-                }
-            } finally {
-                if (session != null) {
-                    activeSessions.remove(session.getFileName());
-                }
-                if (raf != null) {
-                    try {
-                        raf.close();
-                    } catch (IOException ignored) {}
-                }
-                if (socket != null && !socket.isClosed()) {
-                    try {
-                        socket.close();
-                    } catch (IOException ignored) {}
+            } else {
+                System.out.println("[TCP RECEIVER] Quá trình nhận file bị gián đoạn tại byte: " + bytesReceived);
+                if (listener != null) {
+                    listener.onStopped(fileName, bytesReceived);
                 }
             }
-        }
-    }
 
-    /**
-     * Xác định tên file đích để tránh ghi đè file cũ (vd: file.txt -> file (1).txt).
-     */
-    private static File resolveDestinationFile(File dir, String fileName) {
-        File target = new File(dir, fileName);
-        if (!target.exists()) {
-            return target;
-        }
-
-        String baseName = fileName;
-        String extension = "";
-        int dotIdx = fileName.lastIndexOf('.');
-        if (dotIdx > 0) {
-            baseName = fileName.substring(0, dotIdx);
-            extension = fileName.substring(dotIdx);
-        }
-
-        int count = 1;
-        while (target.exists()) {
-            target = new File(dir, baseName + " (" + count + ")" + extension);
-            count++;
-        }
-        return target;
-    }
-
-    private static void copyFile(File source, File dest) throws IOException {
-        try (InputStream in = new BufferedInputStream(new FileInputStream(source));
-             RandomAccessFile out = new RandomAccessFile(dest, "rw")) {
-            byte[] buf = new byte[64 * 1024];
-            int r;
-            while ((r = in.read(buf)) != -1) {
-                out.write(buf, 0, r);
-            }
-        }
-    }
-
-    /**
-     * Tính mã băm SHA-256 của file đã lưu để đối chiếu tính toàn vẹn.
-     */
-    public static String calculateSHA256(File file) {
-        if (file == null || !file.exists()) {
-            return "";
-        }
-        try (InputStream is = new BufferedInputStream(new FileInputStream(file))) {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] buf = new byte[64 * 1024];
-            int r;
-            while ((r = is.read(buf)) != -1) {
-                digest.update(buf, 0, r);
-            }
-            byte[] hash = digest.digest();
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : hash) {
-                hexString.append(String.format("%02x", b));
-            }
-            return hexString.toString();
         } catch (Exception e) {
-            return "";
+            System.err.println("[TCP RECEIVER] Lỗi khi nhận file: " + e.getMessage());
+            if (listener != null) {
+                listener.onError(fileName, e.getMessage(), e);
+            }
+        } finally {
+            if (raf != null) {
+                try { raf.close(); } catch (IOException ignored) {}
+            }
+            if (socket != null && !socket.isClosed()) {
+                try { socket.close(); } catch (IOException ignored) {}
+            }
         }
     }
 
-    public boolean isRunning() {
-        return running;
+    /**
+     * Hàm main chạy trực tiếp Server nhận file (tương tự như EchoChatSingleServer mẫu).
+     */
+    public static void main(String[] args) throws IOException {
+        System.out.println("=== KHỞI ĐỘNG TCP FILE RECEIVER (NHIỆM VỤ 3 - HUÂN) ===");
+        FileReceiver receiver = new FileReceiver(DEFAULT_PORT, new File("./received_files"));
+        // Chạy trực tiếp trong luồng hiện tại để quan sát console
+        receiver.run();
     }
 }
